@@ -1,4 +1,4 @@
-Name: Build Pixelbook Go (ATLAS) Full November Googlebook OS
+name: Build Pixelbook Go (ATLAS) Full November Googlebook OS
 
 on:
   workflow_dispatch:
