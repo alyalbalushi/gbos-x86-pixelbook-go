@@ -1,0 +1,54 @@
+name: Build Pixelbook Go (ATLAS) Full November Googlebook OS
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_november_ota:
+        description: 'Apply Full November OTA (17.CL3B.260622.286.R2) & Re-Patch'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-atlas-image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Maximize Free Disk Space (~75 GB Free)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker image prune -a -f || true
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Build Full November Googlebook OS Image for Pixelbook Go (ATLAS)
+        env:
+          APPLY_NOVEMBER_OTA: ${{ inputs.apply_november_ota }}
+        run: |
+          chmod +x build_pixelbook_go_atlas_gbos.sh
+          ./build_pixelbook_go_atlas_gbos.sh --standard
+
+      - name: Publish Flashable Image (.img.gz) to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: atlas-nov-${{ github.run_number }}
+          name: "Pixelbook Go (ATLAS) Googlebook OS — November Build #${{ github.run_number }}"
+          body: |
+            ### Googlebook OS for 2019 Google Pixelbook Go (ATLAS)
+            - **OS Build**: Full November 2026 (17.CL3B.260622.286.R2) via ota-update.sh + port_build.sh
+            - **GPU & Apps**: Native Intel Vulkan (vulkan.intel.so) + early_patch.sh / apex_patch.sh (Fixes blank/white apps)
+            - **UI**: Hardware-accelerated Frosted-Glass Blur (supports_background_blur=1) + 2400x1350 desktop scaling
+            - **Audio & Hardware**: Intel AVS DSP topologies (MAX98373 speakers + DA7219 headset/mic + DMIC), keyboard backlight (35%), and s2idle lid-close fix
+          files: |
+            atlas-build/gbos-x86/dist/gbOS86-*.img.gz
+            atlas-build/gbos-x86/usb/atlas_fixes.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
