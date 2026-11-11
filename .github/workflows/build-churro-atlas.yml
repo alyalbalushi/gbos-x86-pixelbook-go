@@ -1,0 +1,308 @@
+name: Build Project Churro for Pixelbook Go (ATLAS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fast_patch_last_release:
+        description: 'Fast 4-Min Audio/Webcam/Bluetooth Patch Using Existing Release (Skip 75-Min Compile)'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+      apply_latest_ota:
+        description: 'Apply Latest Google OTA Delta Before Building (Full Build Only)'
+        required: true
+        default: '1'
+        type: choice
+        options:
+          - '1'
+          - '0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-churro-atlas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Maximize Free Disk Space (~100 GB Free)
+        run: |
+          sudo swapoff -a || true
+          sudo rm -rf /mnt/swapfile /swapfile \
+                      /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /opt/hostedtoolcache \
+                      /usr/local/aws-cli /usr/local/share/chromium /usr/lib/jvm
+          sudo docker system prune -a -f --volumes || true
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install & Verify Project Churro, LLVM 18 & SPIRV-Tools Dependencies
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -o Acquire::Check-Valid-Until=false
+
+          sudo apt-get install -y \
+            gdisk dosfstools parted grub-common grub-efi-amd64-bin cpio attr kmod openssl \
+            curl wget git unzip zip jq python3 python3-pip python3-venv python3-mako python3-yaml python3-ply \
+            binutils lz4 zstd xz-utils bzip2 build-essential flex bison bc rsync pkg-config \
+            cmake ninja-build meson libssl-dev libelf-dev libdw-dev zlib1g-dev \
+            autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy default-jre-headless \
+            gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso
+
+          sudo apt-get install -y \
+            llvm-18-dev libclang-18-dev libclc-18-dev libllvmspirvlib-18-dev clang-18 \
+            spirv-tools spirv-headers glslang-tools glslang-dev \
+            libdrm-dev libexpat1-dev zlib1g-dev
+
+          pkg-config --exists --print-errors SPIRV-Tools
+          echo "[*] Verified SPIRV-Tools pkg-config version: $(pkg-config --modversion SPIRV-Tools)"
+
+      - name: Clone Project Churro & Pixelbook Go (ATLAS) Hardware Sources
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/churro-build"
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+
+          git clone --depth 1 https://github.com/alesimula/project-churro.git
+          git clone --depth 1 https://github.com/WeirdTreeThing/chromebook-linux-audio.git
+          git clone --depth 1 https://github.com/WeirdTreeThing/alsa-ucm-conf-cros.git
+
+          chmod +x "$WORKDIR/project-churro/churro.sh" \
+                   "$WORKDIR/project-churro/tools/"*.sh \
+                   "$WORKDIR/project-churro/gfx/"*.sh \
+                   "$WORKDIR/project-churro/crypto/"*.sh \
+                   "$WORKDIR/project-churro/kmod/"*.sh 2>/dev/null || true
+
+          mkdir -p "$WORKDIR/deb-fw"
+          cd "$WORKDIR/deb-fw"
+          FW_DEB_URL="$(curl -fsSL https://packages.debian.org/sid/all/firmware-intel-sound/download | grep -oE 'https?://[^"]+/firmware-intel-sound_[^"]+_all\.deb' | head -n1 || true)"
+          if [ -n "$FW_DEB_URL" ]; then
+            curl -fL -o firmware-intel-sound.deb "$FW_DEB_URL" || true
+            dpkg-deb -x firmware-intel-sound.deb "$WORKDIR/deb-fw/extracted" || true
+            rm -f firmware-intel-sound.deb
+          fi
+
+      - name: Configure Pixelbook Go (ATLAS) Audio, Webcam (uvcvideo), & Bluetooth Fix
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/churro-build"
+          cd "$WORKDIR/project-churro"
+
+          sed -i 's/libllvmspirvlib-18-dev/libllvmspirvlib-18-dev spirv-tools spirv-headers/' gfx/build-mesa.sh
+
+          # 1. Add Pixelbook Go (ATLAS) Audio, UVC Webcam & EC Modules to kmod/profiles/generic.conf
+          if [ -f "kmod/profiles/generic.conf" ]; then
+            cat << 'KCFG_EOF' >> "kmod/profiles/generic.conf"
+          M+=" USB_VIDEO_CLASS SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"
+          KCFG_EOF
+            sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
+          fi
+
+          # 2. Stage Intel cAVS 1.5 Firmware & Topologies into features/firmware-extra/vendor/firmware/intel/avs
+          FW_DEST="features/firmware-extra/vendor/firmware/intel/avs"
+          mkdir -p "$FW_DEST/skl" "$FW_DEST/kbl"
+          if [ -d "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/avs" ]; then
+            cp -rf "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/avs/"* "$FW_DEST/" 2>/dev/null || true
+          fi
+          cp -rf "$WORKDIR/chromebook-linux-audio/blobs/avs/"* "$FW_DEST/" 2>/dev/null || true
+          if [ -f "$FW_DEST/skl/dsp_basefw.bin" ] && [ ! -f "$FW_DEST/kbl/dsp_basefw.bin" ]; then
+            cp -f "$FW_DEST/skl/dsp_basefw.bin" "$FW_DEST/kbl/dsp_basefw.bin"
+          fi
+          if [ -f "$FW_DEST/hda-80862809-tplg.bin" ] && [ ! -f "$FW_DEST/hda-8086280b-tplg.bin" ]; then
+            cp -f "$FW_DEST/hda-80862809-tplg.bin" "$FW_DEST/hda-8086280b-tplg.bin"
+          fi
+          rm -rf "$WORKDIR/deb-fw" "$WORKDIR/chromebook-linux-audio" "$WORKDIR/alsa-ucm-conf-cros"
+
+          # 3. Update features/audio-generic/patch-vendor_dlkm.sh to force dsp_driver=4 (AVS) and preload MAX98373/DA7219/DMIC/uvcvideo
+          cat << 'DLKM_EOF' >> features/audio-generic/patch-vendor_dlkm.sh
+          grep -q 'dsp_driver=4' "$D/modules.options" 2>/dev/null || {
+            echo "options snd_intel_dspcfg dsp_driver=4" >> "$D/modules.options"
+            echo "options snd_soc_avs ignore_fw_version=1" >> "$D/modules.options"
+          }
+          grep -q 'softdep snd_soc_avs' "$D/modules.softdep" 2>/dev/null || {
+            echo "softdep snd_soc_avs pre: uvcvideo snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio" >> "$D/modules.softdep"
+          }
+          DLKM_EOF
+          sed -i 's/^          //' features/audio-generic/patch-vendor_dlkm.sh
+
+          # 4. Update features/audio-generic/get_variant_audio to accept avsmax98373 / avsda7219 / MAX98373 I2S cards and unmute all cards
+          sed -i 's/case \$id in sof\*)/case \$id in sof\*|avs\*|MAX98373\*|DA7219\*)/' features/audio-generic/get_variant_audio
+          sed -i 's|/vendor/bin/churro-mixer "\$n"|for c in /sys/class/sound/card[0-9]*; do /vendor/bin/churro-mixer "${c##*card}" 2>/dev/null || true; done|' features/audio-generic/get_variant_audio
+
+          # 5. Update features/audio-generic/churro-mixer.c to unmute MAX98373 Speaker Switch and DA7219 Headphone Switch
+          python3 - << 'PY_MIXER'
+          p = "features/audio-generic/churro-mixer.c"
+          src = open(p).read()
+          old_sw = 'int sw = (strstr(name, "Playback Switch") && !strstr(name, "Beep")) ||\n                 !strcmp(name, "Capture Switch");'
+          new_sw = '''int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") ||
+                     strstr(name, "Spk Switch") || strstr(name, "Headphone Switch") ||
+                     strstr(name, "Sense Switch") || strstr(name, "Enable Switch") ||
+                     strstr(name, "DACL Switch") || strstr(name, "DACR Switch")) &&
+                    !strstr(name, "Beep")) || !strcmp(name, "Capture Switch");'''
+          old_vol = 'int vol = !strcmp(name, "Master Playback Volume");'
+          new_vol = '''int vol = !strcmp(name, "Master Playback Volume") ||
+                    strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") ||
+                    strstr(name, "Headphone Volume") || strstr(name, "Capture Volume");'''
+          assert old_sw in src and old_vol in src, "Pattern mismatch in churro-mixer.c"
+          src = src.replace(old_sw, new_sw).replace(old_vol, new_vol)
+          open(p, "w").write(src)
+          PY_MIXER
+
+          # 6. Update features/audio-generic/patch-vendor.sh for idempotent fast-repack, AVS PCM 1 configs, and i915 VA-API camera symlink
+          python3 - << 'PY_VENDOR'
+          p = "features/audio-generic/patch-vendor.sh"
+          src = open(p).read()
+          idempotent_clean = '''T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux
+          rm -f "$T/bin/churro-atlas-init.sh" "$T/etc/init/init.churro.atlas.rc" 2>/dev/null || true
+          if [ -f "$T/lib64/iHD_drv_video.so" ] && [ ! -e "$T/lib64/i965_drv_video.so" ]; then
+            ln -sfn iHD_drv_video.so "$T/lib64/i965_drv_video.so"
+            setfattr -h -n security.selinux -v u:object_r:same_process_hal_file:s0 "$T/lib64/i965_drv_video.so" 2>/dev/null || true
+          fi
+          for old_d in "$A"/*/; do
+            [ -f "${old_d%/}/audio_config.xml" ] && grep -q "Project Churro" "${old_d%/}/audio_config.xml" && rm -rf "${old_d%/}"
+          done
+          sed -i '/; Project Churro audio-generic:/,$d' "$S/vendor_sepolicy.cil" 2>/dev/null || true'''
+          src = src.replace('T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux', idempotent_clean, 1)
+
+          avs_cards = '''mk sofhdadsp sof-hda-dsp 6 3 4 5
+          mk avsmax98373 "avs_max98373" 0
+          mk MAX98373 "AVS I2S MAX98373" 0
+          mk avsda7219 "avs_da7219" 0
+          mk DA7219 "AVS I2S DA7219" 0
+          for avs_d in avsmax98373 MAX98373 avsda7219 DA7219; do
+            sed -i "s|<PlaybackPCM>hw:${W},0</PlaybackPCM>|<PlaybackPCM>hw:${W},1</PlaybackPCM>|g" "$A/$avs_d/audio_config.xml" 2>/dev/null || true
+          done'''
+          src = src.replace('mk sofhdadsp sof-hda-dsp 6 3 4 5   # SOF HDA topology: 0 analog, 3-5 HDMI, 6 DMIC', avs_cards, 1)
+          open(p, "w").write(src)
+          PY_VENDOR
+
+          # 7. Inject early-init vendor_modprobe for Webcam (uvcvideo) + Audio (snd_soc_avs), 160 DPI & Bluetooth A2DP fix
+          mkdir -p features/audio-generic/vendor/etc/init
+          cat << 'ATLAS_RC' > features/audio-generic/vendor/etc/init/init.churro.atlas.rc
+          on early-init
+              setprop ro.sf.lcd_density 160
+              setprop persist.sys.dpi 160
+              setprop persist.aicore.enabled false
+              setprop persist.bluetooth.a2dp_offload.disabled false
+              exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules uvcvideo videobuf2_vmalloc videobuf2_v4l2 videobuf2_common snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio snd_soc_avs cros_ec_lpcs cros_ec_dev leds_cros_ec
+
+          on boot
+              exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules uvcvideo snd_soc_avs
+
+          on property:sys.boot_completed=1
+              write /sys/class/leds/chromeos::kbd_backlight/brightness 35
+              write /sys/power/mem_sleep s2idle
+          ATLAS_RC
+          sed -i 's/^          //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
+
+      - name: Build or Fast-Patch Project Churro Image
+        env:
+          FAST_PATCH: ${{ inputs.fast_patch_last_release }}
+          APPLY_LATEST_OTA: ${{ inputs.apply_latest_ota }}
+          DEBIAN_FRONTEND: noninteractive
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WORKDIR="$GITHUB_WORKSPACE/churro-build"
+          cd "$WORKDIR/project-churro"
+          mkdir -p out
+
+          FAST_DONE=0
+          if [ "${FAST_PATCH}" = "1" ]; then
+            echo "[*] Checking for existing release image to fast-patch in ~4 minutes..."
+            if gh release download --repo "$GITHUB_REPOSITORY" --pattern "churro-pixelbook-go-atlas.img.gz.part-*" --dir "$WORKDIR/prev" 2>/dev/null; then
+              echo "[*] Downloaded previous release parts! Reassembling and unpacking..."
+              cat "$WORKDIR/prev/"churro-pixelbook-go-atlas.img.gz.part-* | gzip -d > out/churro-pixelbook-go-atlas.img
+              rm -rf "$WORKDIR/prev"
+
+              HERE="$WORKDIR/project-churro"
+              export EROFS_BIN="$HERE/tools/bin"
+              if [ ! -x "$EROFS_BIN/mkfs.erofs" ]; then
+                sudo -E bash "$HERE/tools/build-erofs-utils.sh" "$EROFS_BIN"
+              fi
+
+              LOOP_DEV="$(sudo losetup -Pf --show out/churro-pixelbook-go-atlas.img)"
+              trap 'sudo losetup -d "$LOOP_DEV" 2>/dev/null || true' EXIT
+              SUPER_PART="$(lsblk -lnpo NAME,PARTLABEL "$LOOP_DEV" | awk '$2=="super" {print $1; exit}')"
+              echo "[*] Repacking vendor_dlkm_a and vendor_a inside $SUPER_PART..."
+
+              sudo -E bash -c "
+                set -euo pipefail
+                HERE='$HERE'
+                EROFS_BIN='$EROFS_BIN'
+                source '$HERE/lib/repack.sh'
+                erofs_repack '$SUPER_PART' vendor_dlkm_a /vendor_dlkm '$HERE/features/audio-generic'
+                erofs_repack '$SUPER_PART' vendor_a /vendor '$HERE/features/audio-generic' '$HERE/features/firmware-extra'
+              "
+              sudo losetup -d "$LOOP_DEV"
+              trap - EXIT
+              FAST_DONE=1
+              echo "[*] Fast-patch completed in ~4 minutes!"
+            else
+              echo "[!] No previous release found; falling back to full build..."
+            fi
+          fi
+
+          if [ "$FAST_DONE" = "0" ]; then
+            echo "[*] Querying Google production_recovery.json for official recovery image..."
+            CATALOG_JSON="$(curl -fsSL https://dl.google.com/dl/edgedl/device/recovery/production_recovery.json || true)"
+            REC_URL="$(echo "$CATALOG_JSON" | jq -r '.[] | select(.device=="ruby" or .model=="ruby" or (.url | contains("ruby"))) | .url' | head -n1 || true)"
+            if [ -z "$REC_URL" ] || [ "$REC_URL" = "null" ]; then
+              REC_URL="https://dl.google.com/device/recovery/ruby-user/16452207/recovery.zip"
+            fi
+            curl -fL "$REC_URL" -o "$WORKDIR/recovery.zip"
+            unzip -p "$WORKDIR/recovery.zip" > "$WORKDIR/recovery.bin"
+            rm -f "$WORKDIR/recovery.zip"
+
+            CURRENT_BIN="$WORKDIR/recovery.bin"
+            if [ "${APPLY_LATEST_OTA}" = "1" ] && [ -x "tools/updater/ota-check.sh" ]; then
+              STEP=1
+              while ./tools/updater/ota-check.sh "$CURRENT_BIN" 2>&1; do
+                NEXT_BIN="$WORKDIR/recovery_ota_${STEP}.bin"
+                ./tools/updater/ota-update.sh "$CURRENT_BIN" --bin "$NEXT_BIN" || break
+                rm -f "$CURRENT_BIN"
+                CURRENT_BIN="$NEXT_BIN"
+                STEP=$((STEP + 1))
+              done
+            fi
+
+            yes "" | sudo -E ./churro.sh auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img || \
+              sudo -E ./churro.sh auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img <<< ""
+            rm -f "$CURRENT_BIN"
+            sudo rm -rf /var/cache/churro 2>/dev/null || true
+          fi
+
+          echo "[*] Compressing and chunking into 1900MB parts..."
+          cd out
+          gzip -c churro-pixelbook-go-atlas.img | split -b 1900M - churro-pixelbook-go-atlas.img.gz.part-
+          rm -f churro-pixelbook-go-atlas.img
+
+          cat << 'SH_REASM' > reassemble.sh
+          #!/bin/sh
+          cat churro-pixelbook-go-atlas.img.gz.part-* > churro-pixelbook-go-atlas.img.gz
+          gzip -d churro-pixelbook-go-atlas.img.gz
+          SH_REASM
+          chmod +x reassemble.sh
+          ls -lh churro-pixelbook-go-atlas.img.gz.part-*
+
+      - name: Upload Flashable Project Churro Image Parts to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: churro-atlas-${{ github.run_number }}
+          name: "Project Churro for Pixelbook Go (ATLAS) — Build #${{ github.run_number }}"
+          body: |
+            ### Project Churro (Googlebook OS / Android 17) — Google Pixelbook Go (`ATLAS`)
+            - **Fast-Patched Audio, Webcam & Bluetooth**: Native `features/audio-generic` support for `avsmax98373` / `avsda7219` (`PCM 1`), early-init `vendor_modprobe` loading for `uvcvideo` (1080p60 Duo Cam) and `snd_soc_avs`, `i965_drv_video.so` VA-API camera link, and Bluetooth A2DP restored.
+          files: |
+            churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
+            churro-build/project-churro/out/reassemble.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
