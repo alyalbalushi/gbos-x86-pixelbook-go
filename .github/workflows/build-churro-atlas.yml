@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       fast_patch_last_release:
-        description: 'Fast 4-Min Audio/Webcam/Bluetooth Patch Using Existing Release (Skip 75-Min Compile)'
+        description: 'Fast 3-Min Audio/Webcam/Bluetooth Patch Using Existing Release (Skip 75-Min Compile)'
         required: true
         default: '1'
         type: choice
@@ -28,41 +28,57 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Maximize Free Disk Space (~100 GB Free)
+      - name: Maximize Free Disk Space
         run: |
-          sudo swapoff -a || true
-          sudo rm -rf /mnt/swapfile /swapfile \
-                      /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /usr/local/share/boost /opt/hostedtoolcache \
-                      /usr/local/aws-cli /usr/local/share/chromium /usr/lib/jvm
-          sudo docker system prune -a -f --volumes || true
-          sudo apt-get clean
+          if [ "${{ inputs.fast_patch_last_release }}" != "1" ]; then
+            sudo swapoff -a || true
+            sudo rm -rf /mnt/swapfile /swapfile \
+                        /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                        /usr/local/share/boost /opt/hostedtoolcache \
+                        /usr/local/aws-cli /usr/local/share/chromium /usr/lib/jvm
+          else
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          fi
           df -h
 
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install & Verify Project Churro, LLVM 18 & SPIRV-Tools Dependencies
+      - name: Install Dependencies (With Azure Mirror Fallback & Retries)
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update -o Acquire::Check-Valid-Until=false
 
-          sudo apt-get install -y \
-            gdisk dosfstools parted grub-common grub-efi-amd64-bin cpio attr kmod openssl \
-            curl wget git unzip zip jq python3 python3-pip python3-venv python3-mako python3-yaml python3-ply \
-            binutils lz4 zstd xz-utils bzip2 build-essential flex bison bc rsync pkg-config \
-            cmake ninja-build meson libssl-dev libelf-dev libdw-dev zlib1g-dev \
-            autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy default-jre-headless \
-            gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso
+          # Fix GitHub runner Azure Ubuntu mirror DNS timeouts by adding public DNS & official archive.ubuntu.com mirror
+          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf >/dev/null || true
+          echo "nameserver 1.1.1.1" | sudo tee -a /etc/resolv.conf >/dev/null || true
+          if [ -f /etc/apt/apt-mirrors.txt ]; then
+            sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/apt-mirrors.txt || true
+          fi
+          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
 
-          sudo apt-get install -y \
-            llvm-18-dev libclang-18-dev libclc-18-dev libllvmspirvlib-18-dev clang-18 \
-            spirv-tools spirv-headers glslang-tools glslang-dev \
-            libdrm-dev libexpat1-dev zlib1g-dev
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::Check-Valid-Until=false update
 
-          pkg-config --exists --print-errors SPIRV-Tools
-          echo "[*] Verified SPIRV-Tools pkg-config version: $(pkg-config --modversion SPIRV-Tools)"
+          if [ "${{ inputs.fast_patch_last_release }}" = "1" ]; then
+            # Fast-patch only needs EROFS / xattr / loop tools (takes ~15 seconds instead of 5 minutes)
+            sudo apt-get -o Acquire::Retries=5 install -y --fix-missing \
+              gdisk parted kpartx e2fsprogs erofs-utils attr cpio kmod jq curl git unzip \
+              build-essential autoconf automake libtool pkg-config liblz4-dev uuid-dev libselinux1-dev zlib1g-dev
+          else
+            # Full build dependencies (Kernel + Mesa 26 + LLVM 18 + SPIRV-Tools)
+            sudo apt-get -o Acquire::Retries=5 install -y --fix-missing \
+              gdisk dosfstools parted grub-common grub-efi-amd64-bin cpio attr kmod openssl \
+              curl wget git unzip zip jq python3 python3-pip python3-venv python3-mako python3-yaml python3-ply \
+              binutils lz4 zstd xz-utils bzip2 build-essential flex bison bc rsync pkg-config \
+              cmake ninja-build meson libssl-dev libelf-dev libdw-dev zlib1g-dev \
+              autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy default-jre-headless \
+              gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso \
+              llvm-18-dev libclang-18-dev libclc-18-dev libllvmspirvlib-18-dev clang-18 \
+              spirv-tools spirv-headers glslang-tools glslang-dev libdrm-dev libexpat1-dev
+
+            pkg-config --exists --print-errors SPIRV-Tools
+            echo "[*] Verified SPIRV-Tools pkg-config version: $(pkg-config --modversion SPIRV-Tools)"
+          fi
 
       - name: Clone Project Churro & Pixelbook Go (ATLAS) Hardware Sources
         run: |
@@ -217,7 +233,7 @@ jobs:
 
           FAST_DONE=0
           if [ "${FAST_PATCH}" = "1" ]; then
-            echo "[*] Checking for existing release image to fast-patch in ~4 minutes..."
+            echo "[*] Checking for existing release image to fast-patch in ~3 minutes..."
             if gh release download --repo "$GITHUB_REPOSITORY" --pattern "churro-pixelbook-go-atlas.img.gz.part-*" --dir "$WORKDIR/prev" 2>/dev/null; then
               echo "[*] Downloaded previous release parts! Reassembling and unpacking..."
               cat "$WORKDIR/prev/"churro-pixelbook-go-atlas.img.gz.part-* | gzip -d > out/churro-pixelbook-go-atlas.img
@@ -245,7 +261,7 @@ jobs:
               sudo losetup -d "$LOOP_DEV"
               trap - EXIT
               FAST_DONE=1
-              echo "[*] Fast-patch completed in ~4 minutes!"
+              echo "[*] Fast-patch completed in ~3 minutes!"
             else
               echo "[!] No previous release found; falling back to full build..."
             fi
