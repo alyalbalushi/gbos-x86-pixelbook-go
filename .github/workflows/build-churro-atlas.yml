@@ -109,14 +109,14 @@ jobs:
           WORKDIR="$GITHUB_WORKSPACE/churro-build"
           cd "$WORKDIR/project-churro"
 
-          sed -i 's|libllvmspirvlib-18-dev|libllvmspirvlib-18-dev spirv-tools spirv-headers|' gfx/build-mesa.sh
+          sed -i 's/libllvmspirvlib-18-dev/libllvmspirvlib-18-dev spirv-tools spirv-headers/' gfx/build-mesa.sh
 
           # 1. Add Pixelbook Go (ATLAS) Audio, UVC Webcam & EC Modules to kmod/profiles/generic.conf
           if [ -f "kmod/profiles/generic.conf" ]; then
             cat << 'KCFG_EOF' >> "kmod/profiles/generic.conf"
           M+=" USB_VIDEO_CLASS SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"
           KCFG_EOF
-            sed -i 's|^          ||' "kmod/profiles/generic.conf" 2>/dev/null || true
+            sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
           fi
 
           # 2. Stage Intel cAVS 1.5 Firmware & Topologies into features/firmware-extra/vendor/firmware/intel/avs
@@ -144,11 +144,16 @@ jobs:
             echo "softdep snd_soc_avs pre: uvcvideo snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio" >> "$D/modules.softdep"
           }
           DLKM_EOF
-          sed -i 's|^          ||' features/audio-generic/patch-vendor_dlkm.sh
+          sed -i 's/^          //' features/audio-generic/patch-vendor_dlkm.sh
 
-          # 4. Update features/audio-generic/get_variant_audio to accept avsmax98373 / avsda7219 / MAX98373 I2S cards and unmute all cards
-          sed -i 's|case \$id in sof\*)|case \$id in sof\*|avs\*|MAX98373\*|DA7219\*)|' features/audio-generic/get_variant_audio
-          sed -i 's|/vendor/bin/churro-mixer "\$n"|for c in /sys/class/sound/card[0-9]*; do /vendor/bin/churro-mixer "${c##*card}" 2>/dev/null || true; done|' features/audio-generic/get_variant_audio
+          # 4. Update features/audio-generic/get_variant_audio using Python (avoids sed delimiter escaping issues)
+          python3 - << 'PY_GVA'
+          p = "features/audio-generic/get_variant_audio"
+          src = open(p).read()
+          src = src.replace("case $id in sof*)", "case $id in sof*|avs*|MAX98373*|DA7219*)")
+          src = src.replace('/vendor/bin/churro-mixer "$n"', 'for c in /sys/class/sound/card[0-9]*; do /vendor/bin/churro-mixer "${c##*card}" 2>/dev/null || true; done')
+          open(p, "w").write(src)
+          PY_GVA
 
           # 5. Update features/audio-generic/churro-mixer.c to unmute MAX98373 Speaker Switch and DA7219 Headphone Switch
           python3 - << 'PY_MIXER'
@@ -205,6 +210,8 @@ jobs:
               setprop persist.sys.dpi 160
               setprop persist.aicore.enabled false
               setprop persist.bluetooth.a2dp_offload.disabled false
+              setprop service.adb.tcp.port 5555
+              setprop persist.adb.tcp.port 5555
               exec u:r:vendor_modprobe:s0 -- /vendor/bin/modprobe -a -d /vendor/lib/modules uvcvideo videobuf2_vmalloc videobuf2_v4l2 videobuf2_common snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio snd_soc_avs cros_ec_lpcs cros_ec_dev leds_cros_ec
 
           on boot
@@ -214,7 +221,7 @@ jobs:
               write /sys/class/leds/chromeos::kbd_backlight/brightness 35
               write /sys/power/mem_sleep s2idle
           ATLAS_RC
-          sed -i 's|^          ||' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
+          sed -i 's/^          //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
 
       - name: Build or Fast-Patch Project Churro Image
         env:
